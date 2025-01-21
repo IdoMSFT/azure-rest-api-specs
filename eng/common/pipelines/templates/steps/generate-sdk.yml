@@ -1,0 +1,171 @@
+parameters:
+  - name: SpecRepoOwner
+    type: string
+  - name: SpecRepoName
+    type: string
+  - name: SdkRepoOwner
+    type: string
+  - name: SdkRepoName
+    type: string
+  - name: IntegrationSdkRepoOwner
+    type: string
+    default: ''
+  - name: IntegrationSdkRepoName
+    type: string
+    default: ''
+  - name: SpecRepoCommit
+    type: string
+    default: 'HEAD'
+  - name: SdkRepoCommit
+    type: string
+    default: 'HEAD'
+  - name: ConfigType
+    type: string
+    values:
+      - 'TypeSpec'
+      - 'OpenAPI'
+    default: 'TypeSpec'
+    displayName: 'API specification type'
+  - name: ConfigPath
+    type: string
+    default: 'specification/contosowidgetmanager/Contoso.Management/tspconfig.yaml'
+    displayName: 'Path to API specification file (TypeSpec/OpenAPI)'
+  - name: SkipPullRequestCreation
+    type: boolean
+    default: false
+
+steps:
+- pwsh: |
+    $specRepoDirectory = "$(Pipeline.Workspace)/${{ parameters.SpecRepoName }}"
+    Write-Host "##vso[task.setvariable variable=SpecRepoDirectory]$specRepoDirectory"
+    Write-Host "SpecRepoDirectory variable set to: $specRepoDirectory"
+
+    $sdkRepoDirectory = "$(Pipeline.Workspace)/${{ parameters.SdkRepoName }}"
+    Write-Host "##vso[task.setvariable variable=SdkRepoDirectory]$sdkRepoDirectory"
+    Write-Host "SdkRepoDirectory variable set to: $sdkRepoDirectory"
+
+    $sdkRepoNameForSpecGen = "${{ parameters.SdkRepoName }}"
+    if ($sdkRepoNameForSpecGen.EndsWith('-for-net')) {
+      $sdkRepoNameForSpecGen = $sdkRepoNameForSpecGen + "-track2"
+    }
+    Write-Host "##vso[task.setvariable variable=SdkRepoNameForSpecGen]$sdkRepoNameForSpecGen"
+    Write-Host "SdkRepoNameForSpecGen variable set to: $sdkRepoNameForSpecGen"
+
+    # create variables to be used to create sdk pull request
+    $sdkRepoOwnerForPullRequest = '${{ parameters.SdkRepoOwner }}'
+    $sdkRepoNameForPullRequest = '${{ parameters.SdkRepoName }}'
+
+    if ((-not [string]::IsNullOrEmpty('${{ parameters.IntegrationSdkRepoOwner }}')) -and (-not [string]::IsNullOrEmpty('${{ parameters.IntegrationSdkRepoName }}'))) {
+      $sdkRepoOwnerForPullRequest = '${{ parameters.IntegrationSdkRepoOwner }}'
+      $sdkRepoNameForPullRequest = '${{ parameters.IntegrationSdkRepoName }}'
+    }
+    Write-Host "##vso[task.setvariable variable=SdkRepoOwnerForPullRequest]$sdkRepoOwnerForPullRequest"
+    Write-Host "SdkRepoOwnerForPullRequest variable set to: $sdkRepoOwnerForPullRequest"
+    Write-Host "##vso[task.setvariable variable=SdkRepoNameForPullRequest]$sdkRepoNameForPullRequest"
+    Write-Host "SdkRepoNameForPullRequest variable set to: $sdkRepoNameForPullRequest"
+  displayName: "Create Run Time Variables"
+
+- template: /eng/common/pipelines/templates/steps/sparse-checkout.yml
+  parameters:
+    Paths:
+    - '/*'
+    - '!sdk/**/test-recordings/*'
+    - '!sdk/**/recordings/*'
+    - '!sdk/**/SessionRecords/*'
+    - '!sdk/**/session-records/*'
+    Repositories:
+    - Name: ${{ parameters.SdkRepoOwner }}/${{ parameters.SdkRepoName }}
+      Commitish: ${{ parameters.SdkRepoCommit }}
+      WorkingDirectory: $(SdkRepoDirectory)
+    SkipCheckoutNone: true
+
+- script: |
+    echo "Current path: $(pwd)"
+    if [ "${{ parameters.SpecRepoCommit }}" = "HEAD" ]; then
+      default_commit=$(git rev-parse HEAD)
+      echo "##vso[task.setvariable variable=SpecRepoCommit]$default_commit"
+      echo "SpecRepoCommit variable set to default commit: $default_commit"
+    else
+      echo "##vso[task.setvariable variable=SpecRepoCommit]${{ parameters.SpecRepoCommit }}"
+      echo "SpecRepoCommit variable set to: ${{ parameters.SpecRepoCommit }}"
+    fi
+  displayName: 'Set SpecRepoCommit variable'
+
+- task: NodeTool@0
+  inputs:
+    versionSpec: $(NodeVersion)
+  displayName: 'Install Node.js'
+
+- task: UsePythonVersion@0
+  inputs:
+    versionSpec: $(PythonVersion)
+
+- script: |
+    npm install -g @azure-tools/spec-gen-sdk@$(SpecGenSdkVersion)
+  displayName: 'Install spec-gen-sdk'
+
+- script: |
+    optional_params=""
+    sdk_gen_info="sdk generation from Config : "
+
+    if [ "${{ parameters.ConfigType }}" = "TypeSpec" ]; then
+      optional_params="$optional_params --tsp-config-relative-path ${{ parameters.ConfigPath }}"
+      sdk_gen_info="$sdk_gen_info '${{ parameters.ConfigPath }}',"
+    else
+      optional_params="$optional_params --readme-relative-path ${{ parameters.ConfigPath }}"
+      sdk_gen_info="$sdk_gen_info '${{ parameters.ConfigPath }}',"
+    fi
+
+    if [ "$(Build.Reason)" = "PullRequest" ]; then
+      optional_params="$optional_params --n=$(System.PullRequest.PullRequestId)"
+    fi
+
+    sdk_gen_info="$sdk_gen_info and CommitSHA: '$(SpecRepoCommit)', in SpecRepo: '${{ parameters.SpecRepoOwner }}/${{ parameters.SpecRepoName }}'"
+    echo "##vso[task.setvariable variable=GeneratedSDKInformation]$sdk_gen_info"
+    echo "Generated SDK Information : $sdk_gen_info"
+
+    spec-gen-sdk \
+      --scp "$(SpecRepoDirectory)" \
+      --sdp "$(SdkRepoDirectory)" \
+      --wf "$(Pipeline.Workspace)" \
+      -l "$(SdkRepoNameForSpecGen)" \
+      -c "$(SpecRepoCommit)" \
+      -t $true \
+      $optional_params
+  displayName: 'Generate SDK'
+
+- task: PublishPipelineArtifact@1
+  displayName: Publish SDK ${sdkLanguage} Artifact to Pipeline Artifacts
+  inputs:
+    artifactName: $(sdkArtifactName)
+    targetPath: "$(Pipeline.Workspace)/generatedSdkArtifacts"
+
+- ${{ if eq(parameters.SkipPullRequestCreation, false) }}:
+  - template: /eng/common/pipelines/templates/steps/git-push-changes.yml
+    parameters:
+      BaseRepoBranch: $(PrBranch)-$(Build.BuildId)
+      BaseRepoOwner: azure-sdk
+      CommitMsg: $(GeneratedSDKInformation)
+      TargetRepoOwner: $(SdkRepoOwnerForPullRequest)
+      TargetRepoName: $(SdkRepoNameForPullRequest)
+      PushArgs: "--force"
+      WorkingDirectory: $(SdkRepoDirectory)
+      ScriptDirectory: $(SdkRepoDirectory)/eng/common/scripts
+
+  - task: PowerShell@2
+    displayName: Create pull request
+    condition: and(succeeded(), eq(variables['HasChanges'], 'true'))
+    inputs:
+      pwsh: true
+      workingDirectory: $(SdkRepoDirectory)
+      filePath: $(SdkRepoDirectory)/eng/common/scripts/Submit-PullRequest.ps1
+      arguments: >
+        -RepoOwner "$(SdkRepoOwnerForPullRequest)"
+        -RepoName "$(SdkRepoNameForPullRequest)"
+        -BaseBranch "main"
+        -PROwner "azure-sdk"
+        -PRBranch "$(PrBranch)-$(Build.BuildId)"
+        -AuthToken "$(azuresdk-github-pat)"
+        -PRTitle "$(PrTitle)-generated-from-$(Build.DefinitionName)-$(Build.BuildId)"
+        -PRBody "$(GeneratedSDKInformation)"
+        -OpenAsDraft $true
